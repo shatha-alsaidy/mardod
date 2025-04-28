@@ -1,0 +1,5 @@
+# Environment file
+.env
+
+# Chroma/Vector DB storage
+chroma_db/
