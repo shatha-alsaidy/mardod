@@ -65,6 +65,9 @@ from firebase_admin import credentials, db
 # Used to record and manipulate timestamps (e.g. when tracking keywords)
 from datetime import datetime
 
+import os
+import shutil
+
 
 # Initialize logging
 # Configures the logging system to show messages at INFO level and above
@@ -124,6 +127,15 @@ class Settings(BaseSettings):
 
 # Instantiate and load all config into a single `settings` object
 settings = Settings()
+
+# base disk mount
+mount = settings.chroma_path            
+# folder in your repo containing pre-collected data
+src   = os.path.join(os.getcwd(), "chroma_db")  
+
+# if data not yet on disk, copy it there
+if os.path.isdir(src) and not os.listdir(mount):
+    shutil.copytree(src, mount, dirs_exist_ok=True)
 
 
 # Initialize components at startup
