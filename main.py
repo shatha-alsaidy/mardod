@@ -278,10 +278,17 @@ def process_tiktok_item(item: Dict[str, Any],temp_dir: str,background_tasks: Bac
 
         # Download audio
         audio_path = download_audio(video_url, temp_dir)
+        if not audio_path:
+            logger.error("Failed to download audio for TikTok item")
+            return ""
+
         background_tasks.add_task(cleanup_temp_files, audio_path)
 
         # Transcribe audio
         transcription = transcribe_audio(audio_path)
+        if not transcription:
+            logger.error("Failed to transcribe audio for TikTok item")
+            return ""
         
         # Combine and clean text
         return clean_text(f"{item.get('text', '')} {transcription}")
