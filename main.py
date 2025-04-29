@@ -128,14 +128,19 @@ class Settings(BaseSettings):
 # Instantiate and load all config into a single `settings` object
 settings = Settings()
 
-# base disk mount
-mount = settings.chroma_path            
-# folder in your repo containing pre-collected data
-src   = os.path.join(os.getcwd(), "chroma_db")  
+# src = the folder in your Git repo containing the pre-collected data
+src = os.path.join(os.getcwd(), "chroma_db")  
 
-# if data not yet on disk, copy it there
-if os.path.isdir(src) and not os.listdir(mount):
-    shutil.copytree(src, mount, dirs_exist_ok=True)
+# mount = the Render disk mount path
+mount = settings.chroma_path              # e.g. "/mnt/vectordb"
+
+# make an app-owned subfolder
+dest = os.path.join(mount, "chroma_db")   # <-- new
+
+# only copy on first run (when dest is empty/nonexistent)
+if os.path.isdir(src) and not os.path.exists(dest):
+    os.makedirs(dest, exist_ok=True)      # ensure parent → dest exists
+    shutil.copytree(src, dest, dirs_exist_ok=True)
 
 
 # Initialize components at startup
@@ -157,7 +162,7 @@ async def lifespan(app: FastAPI):
         )
 
         logger.info("Initializing ChromaDB...")
-        app.state.chroma_client = chromadb.PersistentClient(path=settings.chroma_path)
+        app.state.chroma_client = chromadb.PersistentClient(path=dest)
         embedding_fn = SentenceTransformerEmbeddingFunction(model_name=settings.embedding_model)
         app.state.collection = app.state.chroma_client.get_or_create_collection(
             name=settings.collection_name,
