@@ -836,8 +836,3 @@ def search_platform(keyword: str,platform: str,client: ApifyClient,max_results: 
     except Exception as e:
         logger.error(f"{platform.capitalize()} search failed: {str(e)}")
         return (platform, [])
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
