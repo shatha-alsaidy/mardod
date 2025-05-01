@@ -217,38 +217,58 @@ class QueryResponse(BaseModel):
 # =============================================================================
 @log_entry_exit
 async def process_platform_items(items: List[Dict[str, Any]],platform: str,background_tasks: BackgroundTasks) -> List[Document]:
-    """Process items with NO parallelism for TikTok"""
+    """Process items with proper async handling and result processing"""
     try:
         if platform == 'tiktok':
-            # Process one TikTok item at a time
+            # Sequential processing for TikTok
             documents = []
             for item in items:
                 result = await asyncio.to_thread(
                     process_single_item,
                     item=item,
                     platform=platform,
-                    temp_dir=tempfile.TemporaryDirectory().name,
                     background_tasks=background_tasks
                 )
                 if result:
                     documents.extend(result)
-                # Force cleanup after each item
+                # Force memory cleanup
                 import gc
                 gc.collect()
             return documents
         else:
-            # Allow limited parallelism for Twitter (max 2 workers)
-            loop = asyncio.get_event_loop()
+            # Twitter processing with limited parallelism
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                tasks = [...]
-                results = await asyncio.gather(*tasks)
-                return process_results(results)
+                loop = asyncio.get_event_loop()
+                tasks = [
+                    loop.run_in_executor(
+                        executor,
+                        functools.partial(
+                            process_single_item,
+                            item=item,
+                            platform=platform,
+                            background_tasks=background_tasks
+                        )
+                    )
+                    for item in items
+                ]
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Direct result processing (replaces process_results)
+                documents = []
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Processing error: {str(result)}")
+                    elif result:
+                        documents.extend(result)
+                
+                return documents
     except Exception as e:
         logger.error(f"Platform processing failed: {str(e)}")
         return []
     
 @log_entry_exit
-def process_single_item(item: Dict[str, Any],platform: str,temp_dir: str,background_tasks: BackgroundTasks) -> List[Document]:
+def process_single_item(item: Dict[str, Any],platform: str,background_tasks: BackgroundTasks) -> List[Document]:
     """Process a single social media item into chunks"""
     try:
         # Common processing
@@ -258,7 +278,7 @@ def process_single_item(item: Dict[str, Any],platform: str,temp_dir: str,backgro
         
         # Platform-specific processing
         if platform == 'tiktok':
-            text = process_tiktok_item(item, temp_dir, background_tasks)
+            text = process_tiktok_item(item, background_tasks)
         elif platform == 'twitter':
             text = clean_text(item.get("text", ""))
         else:
@@ -289,7 +309,7 @@ def process_single_item(item: Dict[str, Any],platform: str,temp_dir: str,backgro
         logger.error(f"Processing document failed: {str(e)}")
         return []
 @log_entry_exit
-def process_tiktok_item(item: Dict[str, Any],temp_dir: str,background_tasks: BackgroundTasks) -> str:
+def process_tiktok_item(item: Dict[str, Any], background_tasks: BackgroundTasks) -> str:
     """Process TikTok without temp files"""
     try:
         video_url = item.get("webVideoUrl")
@@ -472,8 +492,8 @@ def download_audio(url: str, temp_dir: Union[str, Path]) -> Optional[Path]:
 
     try:
         with youtube_dlp.YoutubeDL(opts) as ydl:
-            audio_data = ydl.extract_info(url, download=False)
-            return audio_data.get('url')  # Get direct URL for streaming
+            info = ydl.extract_info(url, download=False)
+            return info.get('url')  # Return direct audio URL
     except Exception as e:
         logger.error(f"Download failed: {str(e)}")
         return None
