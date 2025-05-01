@@ -68,6 +68,13 @@ from datetime import datetime
 import os
 import shutil
 
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+import random
+import binascii
+
+
 
 # Initialize logging
 # Configures the logging system to show messages at INFO level and above
@@ -132,7 +139,7 @@ settings = Settings()
 src = os.path.join(os.getcwd(), "chroma_db")  
 
 # mount = the Render disk mount path
-mount = settings.chroma_path              # e.g. "/mnt/vectordb"
+mount = settings.chroma_path             
 
 # make an app-owned subfolder
 dest = os.path.join(mount, "chroma_db")   # <-- new
@@ -154,9 +161,16 @@ async def lifespan(app: FastAPI):
         logger.info("Loading Whisper model...")
         app.state.whisper_model = whisper.load_model(settings.whisper_model_size, device='cpu',download_root="./models")
         
+        logger.info("Initializing Keyword Extraction model...")
+        app.state.kw_model = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.7,
+            openai_api_key=settings.openai_api_key
+        )
+
         logger.info("Initializing Chat model...")
         app.state.chat_model = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0.7,
             openai_api_key=settings.openai_api_key
         )
@@ -202,32 +216,42 @@ class QueryResponse(BaseModel):
 # Core Processing Functions (Concurrent)
 # =============================================================================
 @log_entry_exit
-def process_platform_items(items: List[Dict[str, Any]],platform: str,background_tasks: BackgroundTasks) -> List[Document]:
-    """Process items from a single platform concurrently"""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
+async def process_platform_items(items: List[Dict[str, Any]],platform: str,background_tasks: BackgroundTasks) -> List[Document]:
+    """Process items from a single platform using async process pool"""
+    try:
+        loop = asyncio.get_event_loop()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Process items in parallel using process pool
+            tasks = []
             for item in items:
-                futures.append(
-                    executor.submit(
-                        process_single_item,
-                        item,
-                        platform,
-                        temp_dir,
-                        background_tasks
+                tasks.append(
+                    loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            process_single_item,
+                            item=item,
+                            platform=platform,
+                            temp_dir=temp_dir,
+                            background_tasks=background_tasks
+                        )
                     )
                 )
             
-            results = []
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    result = future.result()
-                    if result:
-                        results.extend(result)
-                except Exception as e:
-                    logger.error(f"Processing error: {str(e)}")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            return results
+            # Handle results and errors
+            documents = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Processing error: {str(result)}")
+                elif result:
+                    documents.extend(result)
+            
+            return documents
+    except Exception as e:
+        logger.error(f"Platform processing failed: {str(e)}")
+        return []
+    
 @log_entry_exit
 def process_single_item(item: Dict[str, Any],platform: str,temp_dir: str,background_tasks: BackgroundTasks) -> List[Document]:
     """Process a single social media item into chunks"""
@@ -251,6 +275,7 @@ def process_single_item(item: Dict[str, Any],platform: str,temp_dir: str,backgro
         
         for i, chunk in enumerate(chunks):
             if is_helpful(chunk):
+                print(chunk)
                 documents.append({
                     "id": f"{doc_uuid}_chunk_{i}",
                     "text": chunk,
@@ -267,7 +292,7 @@ def process_single_item(item: Dict[str, Any],platform: str,temp_dir: str,backgro
         return documents
     except Exception as e:
         logger.error(f"Processing document failed: {str(e)}")
-        raise
+        return []
 @log_entry_exit
 def process_tiktok_item(item: Dict[str, Any],temp_dir: str,background_tasks: BackgroundTasks) -> str:
     """Process TikTok item with audio download and transcription"""
@@ -313,8 +338,8 @@ def cleanup_temp_files(file_path: str):
 def chunk_text(text: str) -> List[str]:
     """Text chunking with optimized parameters"""
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=800,
+        chunk_overlap=300,
         separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""],
         length_function=len,
     )
@@ -372,11 +397,11 @@ def is_helpful(text: str) -> bool:
     avg_word_length = sum(len(word) for word in words) / len(words)
 
     # Unique word ratio check (avoid repetitive content)
-    if unique_words / len(words) < 0.55:  # 55% unique words minimum
+    if unique_words / len(words) < 0.4:  # 55% unique words minimum
         return False
 
     # Punctuation density check (max 15% punctuation)
-    if punctuation_count / total_chars > 0.15:
+    if punctuation_count / total_chars > 0.25:
         return False
 
     # Average word length check 
@@ -427,14 +452,36 @@ def download_audio(url: str, temp_dir: Union[str, Path]) -> Optional[Path]:
     """
     outdir = Path(temp_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-    opts = {
+    opts = opts = {
         "format": "bestaudio/best",
-        #"ffmpeg_location": str(FFMPEG_PATH),
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        "keepvideo": False,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
+        "headers": {
+            "User-Agent": "com.zhiliaoapp.musically/2024701030 (Linux; U; Android 14; en_GB; SM-G991B; Build/TP1A.220624.014;tt-ok/3.14.2.3)",
+            "Referer": "https://www.tiktok.com/",
+        },
+        "extractor_args": {
+            "tiktok": {
+                "app_version": "34.5.3",
+                "manifest_app_version": "2024701030",
+                "player_client": "android_hybrid"
+            }
+        },
+        "cookiefile": "cookies.txt",
+        "sleep_interval": 5,  # Add delay between requests
+        "retries": 3,
         "quiet": True,
         "no_warnings": True,
+        "verbose": True,  # -v
+        "update": True, 
     }
+
+    # Add mobile device parameters
+    opts["extractor_args"]["tiktok"].update({
+        "device_id": str(random.randint(1000000000000000000, 9999999999999999999)),
+        "iid": str(random.randint(7000000000000000000, 7999999999999999999)),
+        "openudid": binascii.hexlify(os.urandom(8)).decode(),
+    })
+
     opts["outtmpl"] = str(outdir / "%(id)s.%(ext)s")
     try:
         with youtube_dlp.YoutubeDL(opts) as ydl:
@@ -550,21 +597,10 @@ def transcribe_audio(
         texts.append(res.get("text", "").strip())
         safe_cleanup(chunk_file)
 
-    return " ".join(t for t in texts if t)
+    trans = " ".join(t for t in texts if t)
+    print(trans)
+    return trans
 #####################
-
-@log_entry_exit
-def safe_cleanup(path: Union[str, Path, None]) -> None:
-    if not path:
-        return
-    p = Path(path)
-    try:
-        if p.exists():
-            p.unlink()
-            logger.info("Cleaned up %s", p)
-    except Exception as e:
-        logger.error("Cleanup failed for %s: %s", p, e)
-
 
 # =============================================================================
 # Main Endpoint with Moderation and Validation
@@ -578,28 +614,29 @@ async def handle_query(
     """Main query processing endpoint"""
     try:
         # Moderation check
-        if not moderate_query(request.query):
-            raise HTTPException(status_code=400, detail="Query violates content policies")
+        if not await asyncio.to_thread(moderate_query, request.query):
+            raise HTTPException(400, "Query violates content policies")
         
         # =====================================================================
         # Phase 1: Initial Database Check
         # =====================================================================
         
         # Check existing documents in ChromaDB
-        existing_results = app.state.collection.query(
+        existing_results = await asyncio.to_thread(
+            app.state.collection.query,
             query_texts=[request.query],
             n_results=10,
             include=["documents", "metadatas", "distances"]
         )
-        
+
         # Filter documents based on similarity threshold
-        threshold_distance = 1 - settings.similarity_threshold
+        threshold_similarity = settings.similarity_threshold 
         filtered_docs = []
         for doc, meta, distance in zip(existing_results['documents'][0], 
                                      existing_results['metadatas'][0], 
                                      existing_results['distances'][0]):
             print(doc+"  ----99  dis: "+str(distance))
-            if distance <= threshold_distance and is_helpful(doc):
+            if (1 - distance) >= threshold_similarity and is_helpful(doc): 
                 filtered_docs.append((doc, meta))
         
         # If sufficient relevant documents found, return early
@@ -617,8 +654,12 @@ async def handle_query(
 
         # Keyword extraction
         keywords = await extract_keywords(request.query)
+        logger.info(f"Extracted keywords: {keywords}")
         
-        # Search social media
+        if not keywords:
+            logger.warning("No valid keywords extracted")
+            return fallback_response()
+
         apify_client = ApifyClient(settings.apify_api_key)
         content = await search_social_media(keywords, apify_client)
         
@@ -626,24 +667,29 @@ async def handle_query(
         twitter_items = [item for platform, item in content if platform == 'twitter']
         tiktok_items = [item for platform, item in content if platform == 'tiktok']
         
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            twitter_future = executor.submit(
-                process_platform_items, twitter_items, 'twitter', background_tasks
-            )
-            tiktok_future = executor.submit(
-                process_platform_items, tiktok_items, 'tiktok', background_tasks
-            )
-            
-            all_documents = []
-            for future in [twitter_future, tiktok_future]:
-                try:
-                    all_documents.extend(future.result())
-                except Exception as e:
-                    logger.error(f"Processing error: {str(e)}")
+        # Process platforms concurrently
+        twitter_docs, tiktok_docs = await asyncio.gather(
+            process_platform_items(twitter_items, 'twitter', background_tasks),
+            process_platform_items(tiktok_items, 'tiktok', background_tasks),
+            return_exceptions=True  # Add this to prevent propagation
+        )
+
+        # Handle potential exceptions in platform processing
+        if isinstance(twitter_docs, Exception):
+            logger.error(f"Twitter processing failed: {twitter_docs}")
+            twitter_docs = []
+        if isinstance(tiktok_docs, Exception):
+            logger.error(f"TikTok processing failed: {tiktok_docs}")
+            tiktok_docs = []
+
+        all_documents = twitter_docs + tiktok_docs
+
+        print(all_documents)
 
         # Add to ChromaDB
         if all_documents:
-            app.state.collection.add(
+            await asyncio.to_thread(
+                app.state.collection.add,
                 documents=[doc["text"] for doc in all_documents],
                 metadatas=[doc["metadata"] for doc in all_documents],
                 ids=[doc["id"] for doc in all_documents]
@@ -654,19 +700,20 @@ async def handle_query(
         # =====================================================================   
 
         # Check updated documents in ChromaDB
-        updated_results = app.state.collection.query(
+        updated_results = await asyncio.to_thread(
+            app.state.collection.query,
             query_texts=[request.query],
             n_results=10,
             include=["documents", "metadatas", "distances"]
         )
         
         # Filter documents based on similarity threshold
-        threshold_distance = 1 - settings.similarity_threshold
         filtered_docs = []
         for doc, meta, distance in zip(updated_results['documents'][0], 
                                      updated_results['metadatas'][0], 
                                      updated_results['distances'][0]):
-            if distance <= threshold_distance and is_helpful(doc):
+            print(doc+"  ----88  dis: "+str(distance))
+            if (1 - distance) >= threshold_similarity and is_helpful(doc): 
                 filtered_docs.append((doc, meta))
         
         # If sufficient relevant documents found, return response
@@ -692,6 +739,12 @@ async def handle_query(
     except Exception as e:
         logger.error(f"Processing failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
+    
+def fallback_response():
+    return QueryResponse(
+        answer="عذرًا، لم نتمكن من العثور على معلومات مؤكدة حول هذا الموضوع. يرجى المحاولة مرة أخرى لاحقًا أو تقديم تفاصيل أكثر تحديدًا.",
+        sources=[]
+    )
 
 # =============================================================================
 # AI Components
@@ -707,29 +760,53 @@ def moderate_query(query: str) -> bool:
         return True  # Fail-safe
 @log_entry_exit
 async def extract_keywords(query: str) -> List[str]:
-    """
-    يستخرج 3–5 كلمات بحث مفصولة بفواصل من استعلام المستخدم،
-    مع التأكيد دائماً على أن تشمل أي مدينة أو موقع جغرافي مذكور.
-    """
     keyword_prompt = (
-        "Extract 3–5 comma‑separated search keywords from the user’s query.\n"
+        "Analyze the following user query with a focus on LOCAL CONTEXT and CONCRETE ENTITIES.\n"
+        "Extract 3 search terms (1-2 words each) following these rules:\n"
+        "1. UNDERSTAND THE NATURE OF SOCIAL MEDIA PLATFORMS POSTS: Focus on capturing the topic of the query and provide keywords that people could use in their posts that answer the user’s query.\n"
+        "2. PRIORITIZE SPECIFIC ENTITIES: Include exact names (brands/places/items…ect).\n"
+        "3. COMBINE ENTITY + ACTION/EVENT: Like 'سوق حراء الشارع الرئيسي' or 'مهرجان الرياض للقهوة'.\n"
+        "4. CAPTURE COLLOQUIAL PHRASES: Preserve local spellings (excluding typos).\n"
+        "5. FILTER GENERIC TERMS: Reject vague words like 'events', always be hyper-specific.\n"
+        "6. BALANCE SPECIFICITY WITH BREVITY: and account for informal language.\n"
         "- Must always include any city or location mentioned in the query.\n\n"
         "Examples:\n"
+        "1- ايش اخر تعاونات ويستر؟"
+        "Good Keywords:"
+        "ويستر، تعاونات ويستر، تعاون ويستر، جديد ويستر، عرض ويستر"
+        "2- هل دخول حديقة الوطن مجاني؟"
+        "Good Keywords:"
+        "حديقة الوطن، دخول حديقة الوطن، اسعار حديقة الوطن، سعر حديقة الوطن، حديقة الوطن مجاني"
+        "3- ايش برامج تطوير الخريجين اللي تسجيلها مفتوح إلى الان؟"
+        "Good Keywords:"
+        "تطوير الخريجين، برامج تطوير الخريجين، برنامج تطوير الخريجين،  برامج تدريبية، برنامج تدريب"
+        "Other examples:"
         "Query: أفضل كوفي في الخبر؟\n"
         "Good Keywords: أفضل كوفي الخبر, كوفي الخبر, مقاهي الخبر\n\n"
         "Query: أفضل مطعم بيتزا في الرياض\n"
         "Good Keywords: أفضل بيتزا الرياض, مطاعم بيتزا الرياض, بيتزا الرياض\n\n"
         f"Now your turn:\n"
+        "Format: comma-separated terms, NO explanations.\n"
         f"Query: {query}\n"
-        "Keywords:"
     )
-    # استدعاء النموذج لإنشاء الكلمات المفتاحية
-    response = await app.state.chat_model.ainvoke(keyword_prompt)
-    content = response.content or ""
-    # تجزئة الناتج على الفواصل وتنظيف المسافات
-    keywords = [kw.strip() for kw in content.split(",") if kw.strip()]
-    # الاحتفاظ فقط بعدد max_keywords
-    return keywords[:settings.max_keywords]
+ 
+    response = await app.state.kw_model.ainvoke(keyword_prompt)
+
+    keywords = clean_keywords(response.content)
+
+    return keywords
+
+def clean_keywords(keyword_string: str) -> List[str]:
+    """Parse and clean keywords from model response"""
+    # Normalize Arabic/English commas and split
+    normalized = keyword_string.replace('،', ',')  # Convert Arabic commas to English
+    cleaned = re.sub(r"[^\u0600-\u06FF, ]+", "", normalized)
+    # Split and clean
+    return [
+        kw.strip()
+        for kw in cleaned.split(",")
+        if kw.strip() and len(kw.strip()) > 2
+    ][:settings.max_keywords]
 
 @log_entry_exit
 def _update_keyword_data(current_data):
@@ -792,54 +869,70 @@ def generate_response(results: Dict, query: str) -> QueryResponse:
 # =============================================================================
 @log_entry_exit
 async def search_social_media(keywords: List[str],apify_client: ApifyClient) -> List[tuple]:
-    """Concurrent search of multiple platforms"""
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        for keyword in keywords:
-            futures.append(executor.submit(
+    """Async search of multiple platforms with batched keywords"""
+    try:      
+        # Create platform-specific search parameters
+        twitter_search_terms = [f"{kw} since:2024-01-01_00:00:00_UTC" for kw in keywords]
+        tiktok_search_queries = keywords  # Use raw keywords for TikTok
+
+        # Run platform searches in parallel
+        twitter_results, tiktok_results = await asyncio.gather(
+            asyncio.to_thread(
                 search_platform,
-                keyword,
-                'twitter',
-                apify_client,
-                settings.max_resultsx
-            ))
-            futures.append(executor.submit(
+                platform='twitter',
+                client=apify_client,
+                search_terms=twitter_search_terms,
+                max_results=settings.max_resultsx
+            ),
+            asyncio.to_thread(
                 search_platform,
-                keyword,
-                'tiktok',
-                apify_client,
-                settings.max_resultstiktok
-            ))
-        
+                platform='tiktok',
+                client=apify_client,
+                search_queries=tiktok_search_queries,
+                max_results=settings.max_resultstiktok
+            ),
+            return_exceptions=True
+        )
+
+        # Process results
         results = []
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                platform, items = future.result()
+        for platform, items in [('twitter', twitter_results), ('tiktok', tiktok_results)]:
+            if isinstance(items, Exception):
+                logger.error(f"{platform.capitalize()} search failed: {str(items)}")
+            elif items:
                 results.extend((platform, item) for item in items)
-            except Exception as e:
-                logger.error(f"Search error: {str(e)}")
+        
         return results
+    except Exception as e:
+        logger.error(f"Search failed: {str(e)}")
+        return []
 
 @log_entry_exit
-def search_platform(keyword: str,platform: str,client: ApifyClient,max_results: int) -> tuple:
-    """Search a single platform"""
+def search_platform(platform: str,client: ApifyClient, max_results: int,search_terms: Optional[List[str]] = None,search_queries: Optional[List[str]] = None) -> List[Dict]:
+    """Search a single platform with batched keywords"""
     try:
-        if platform == 'twitter':
+        if platform == 'twitter' and search_terms:
             actor_call = client.actor("CJdippxWmn9uRfooo").call(run_input={
-                "searchTerms": [f"{keyword} since:2024-01-01_00:00:00_UTC"],
+                "searchTerms": search_terms,
                 "maxItems": max_results,
                 "queryType": "Top",
                 "lang": "ar",
             })
-        elif platform == 'tiktok':
+        elif platform == 'tiktok' and search_queries:
             actor_call = client.actor("OtzYfK1ndEGdwWFKQ").call(run_input={
-                "searchQueries": [keyword],
+                "searchQueries": search_queries,
                 "resultsPerPage": max_results,
                 "searchSection": "/video",
                 "shouldDownloadVideos": False,
             })
+        else:
+            return []
             
-        return (platform, list(client.dataset(actor_call["defaultDatasetId"]).iterate_items()))
+        return list(client.dataset(actor_call["defaultDatasetId"]).iterate_items())
     except Exception as e:
         logger.error(f"{platform.capitalize()} search failed: {str(e)}")
-        return (platform, [])
+        return []
+    
+'''if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)'''

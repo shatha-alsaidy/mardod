@@ -1,2 +1,8 @@
 # Environment file
 .env
+
+\venv
+venv
+
+models
+\models
