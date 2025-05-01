@@ -558,7 +558,7 @@ def transcribe_audio(audio_url: str) -> Optional[str]:
     """Transcribe directly from URL without temp files"""
     try:
         # Stream audio directly
-        audio = whisper.load_audio(audio_url, duration=90)
+        audio = whisper.load_audio(audio_url)
         audio = whisper.pad_or_trim(audio)
         
         # Use tiny model
