@@ -453,12 +453,10 @@ FFMPEG_PATH = (
 
 # Cell 4: download_audio function
 @log_entry_exit
-def download_audio(url: str, temp_dir: Union[str, Path]) -> Optional[Path]:
+def download_audio(url: str) -> Optional[str]:
     """
     Download audio from a video URL, convert to MP3, and return the Path
     """
-    outdir = Path(temp_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
     opts = opts = {
         "format": "bestaudio/best",
         "postprocessors": ["-acodec", "libmp3lame"],
