@@ -217,36 +217,44 @@ class QueryResponse(BaseModel):
 # =============================================================================
 @log_entry_exit
 async def process_platform_items(items: List[Dict[str, Any]],platform: str,background_tasks: BackgroundTasks) -> List[Document]:
-    """Process items from a single platform using async process pool"""
+    """Process items with strict memory limits"""
     try:
         loop = asyncio.get_event_loop()
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Process items in parallel using process pool
-            tasks = []
+            # Critical Change: Strict worker limit for 1CPU/1GB environment
+            max_workers = 1 if platform == 'tiktok' else 2  # TikTok is heavier
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            
+            # Process items with controlled parallelism
+            futures = []
             for item in items:
-                tasks.append(
-                    loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            process_single_item,
-                            item=item,
-                            platform=platform,
-                            temp_dir=temp_dir,
-                            background_tasks=background_tasks
-                        )
+                future = loop.run_in_executor(
+                    executor,
+                    functools.partial(
+                        process_single_item,
+                        item=item,
+                        platform=platform,
+                        temp_dir=temp_dir,
+                        background_tasks=background_tasks
                     )
                 )
+                futures.append(future)
             
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Handle results and errors
+            # Process in batches to prevent OOM
+            batch_size = max_workers * 2
             documents = []
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"Processing error: {str(result)}")
-                elif result:
-                    documents.extend(result)
-            
+            for i in range(0, len(futures), batch_size):
+                batch = futures[i:i+batch_size]
+                results = await asyncio.gather(*batch, return_exceptions=True)
+                
+                # Immediate cleanup after each batch
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Processing error: {str(result)}")
+                    elif result:
+                        documents.extend(result)
+                del batch  # Explicit memory release
+                
             return documents
     except Exception as e:
         logger.error(f"Platform processing failed: {str(e)}")
@@ -555,50 +563,55 @@ def transcribe_audio(
     """
     Transcribe an MP3 file, trimming silence and optionally chunking.
     """
-    p = Path(audio_path)
-    if not p.is_file() or p.stat().st_size < 1024:
-        return None
-
-    # Trim silence
-    trimmed = p.with_suffix(".trim.mp3")
-    if strip_silence(p, trimmed):
-        p = trimmed
-
-    # Get duration
     try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(p)
-        ], stderr=subprocess.DEVNULL)
-        duration = float(out.strip())
-    except Exception:
-        duration = 0.0
+        p = Path(audio_path)
+        if not p.is_file() or p.stat().st_size < 1024:
+            return None
 
-    if duration < min_duration:
-        return None
+        # Trim silence
+        trimmed = p.with_suffix(".trim.mp3")
+        if strip_silence(p, trimmed):
+            p = trimmed
 
-    model = whisper_model or whisper.load_model("base")
-    if duration <= chunk_length_s:
-        res = model.transcribe(str(p), language=language, fp16=False, verbose=False)
-        return res.get("text", "").strip() or None
+        # Get duration
+        try:
+            out = subprocess.check_output([
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(p)
+            ], stderr=subprocess.DEVNULL)
+            duration = float(out.strip())
+        except Exception:
+            duration = 0.0
 
-    texts = []
-    num_chunks = int(np.ceil(duration / chunk_length_s))
-    for i in range(num_chunks):
-        start = i * chunk_length_s
-        chunk_file = p.with_name(f"{p.stem}.chunk{i}.mp3")
-        subprocess.run([
-            "ffmpeg", "-y", "-ss", str(start), "-t", str(chunk_length_s),
-            "-i", str(p), "-acodec", "mp3", str(chunk_file)
-        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        res = model.transcribe(str(chunk_file), language=language, fp16=False, verbose=False)
-        texts.append(res.get("text", "").strip())
-        safe_cleanup(chunk_file)
+        if duration < min_duration:
+            return None
 
-    trans = " ".join(t for t in texts if t)
-    print(trans)
+        model = whisper_model or whisper.load_model("base")
+        if duration <= chunk_length_s:
+            res = model.transcribe(str(p), language=language, fp16=False, verbose=False)
+            return res.get("text", "").strip() or None
+
+        texts = []
+        num_chunks = int(np.ceil(duration / chunk_length_s))
+        for i in range(num_chunks):
+            start = i * chunk_length_s
+            chunk_file = p.with_name(f"{p.stem}.chunk{i}.mp3")
+            subprocess.run([
+                "ffmpeg", "-y", "-ss", str(start), "-t", str(chunk_length_s),
+                "-i", str(p), "-acodec", "mp3", str(chunk_file)
+            ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            res = model.transcribe(str(chunk_file), language=language, fp16=False, verbose=False)
+            texts.append(res.get("text", "").strip())
+            safe_cleanup(chunk_file)
+
+        trans = " ".join(t for t in texts if t)
+        print(trans)
+    finally:
+        import gc
+        del model  # Unload Whisper explicitly
+        gc.collect()  # Force garbage collection
     return trans
 #####################
 
