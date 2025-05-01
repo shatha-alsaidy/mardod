@@ -67,6 +67,10 @@ from datetime import datetime
 
 import os
 import shutil
+import binascii
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Union
+
 
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
@@ -459,7 +463,11 @@ def download_audio(url: str) -> Optional[str]:
     """
     opts = opts = {
         "format": "bestaudio/best",
-        "postprocessors": ["-acodec", "libmp3lame"],
+        "postprocessors": [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192'
+                }],
         "headers": {
             "User-Agent": "com.zhiliaoapp.musically/2024701030 (Linux; U; Android 14; en_GB; SM-G991B; Build/TP1A.220624.014;tt-ok/3.14.2.3)",
             "Referer": "https://www.tiktok.com/",
