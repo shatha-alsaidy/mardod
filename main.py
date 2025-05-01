@@ -217,45 +217,32 @@ class QueryResponse(BaseModel):
 # =============================================================================
 @log_entry_exit
 async def process_platform_items(items: List[Dict[str, Any]],platform: str,background_tasks: BackgroundTasks) -> List[Document]:
-    """Process items with strict memory limits"""
+    """Process items with NO parallelism for TikTok"""
     try:
-        loop = asyncio.get_event_loop()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Critical Change: Strict worker limit for 1CPU/1GB environment
-            max_workers = 1 if platform == 'tiktok' else 2  # TikTok is heavier
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-            
-            # Process items with controlled parallelism
-            futures = []
-            for item in items:
-                future = loop.run_in_executor(
-                    executor,
-                    functools.partial(
-                        process_single_item,
-                        item=item,
-                        platform=platform,
-                        temp_dir=temp_dir,
-                        background_tasks=background_tasks
-                    )
-                )
-                futures.append(future)
-            
-            # Process in batches to prevent OOM
-            batch_size = max_workers * 2
+        if platform == 'tiktok':
+            # Process one TikTok item at a time
             documents = []
-            for i in range(0, len(futures), batch_size):
-                batch = futures[i:i+batch_size]
-                results = await asyncio.gather(*batch, return_exceptions=True)
-                
-                # Immediate cleanup after each batch
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.error(f"Processing error: {str(result)}")
-                    elif result:
-                        documents.extend(result)
-                del batch  # Explicit memory release
-                
+            for item in items:
+                result = await asyncio.to_thread(
+                    process_single_item,
+                    item=item,
+                    platform=platform,
+                    temp_dir=tempfile.TemporaryDirectory().name,
+                    background_tasks=background_tasks
+                )
+                if result:
+                    documents.extend(result)
+                # Force cleanup after each item
+                import gc
+                gc.collect()
             return documents
+        else:
+            # Allow limited parallelism for Twitter (max 2 workers)
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                tasks = [...]
+                results = await asyncio.gather(*tasks)
+                return process_results(results)
     except Exception as e:
         logger.error(f"Platform processing failed: {str(e)}")
         return []
@@ -303,27 +290,19 @@ def process_single_item(item: Dict[str, Any],platform: str,temp_dir: str,backgro
         return []
 @log_entry_exit
 def process_tiktok_item(item: Dict[str, Any],temp_dir: str,background_tasks: BackgroundTasks) -> str:
-    """Process TikTok item with audio download and transcription"""
+    """Process TikTok without temp files"""
     try:
         video_url = item.get("webVideoUrl")
         if not video_url:
             return ""
-
-        # Download audio
-        audio_path = download_audio(video_url, temp_dir)
-        if not audio_path:
-            logger.error("Failed to download audio for TikTok item")
-            return ""
-
-        background_tasks.add_task(cleanup_temp_files, audio_path)
-
-        # Transcribe audio
-        transcription = transcribe_audio(audio_path)
-        if not transcription:
-            logger.error("Failed to transcribe audio for TikTok item")
+        
+        # Stream audio directly
+        audio_url = download_audio(video_url)
+        if not audio_url:
             return ""
         
-        # Combine and clean text
+        # Transcribe from URL
+        transcription = transcribe_audio(audio_url)
         return clean_text(f"{item.get('text', '')} {transcription}")
     except Exception as e:
         logger.error(f"TikTok processing failed: {str(e)}")
@@ -462,7 +441,7 @@ def download_audio(url: str, temp_dir: Union[str, Path]) -> Optional[Path]:
     outdir.mkdir(parents=True, exist_ok=True)
     opts = opts = {
         "format": "bestaudio/best",
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
+        "postprocessors": ["-acodec", "libmp3lame"],
         "headers": {
             "User-Agent": "com.zhiliaoapp.musically/2024701030 (Linux; U; Android 14; en_GB; SM-G991B; Build/TP1A.220624.014;tt-ok/3.14.2.3)",
             "Referer": "https://www.tiktok.com/",
@@ -481,6 +460,7 @@ def download_audio(url: str, temp_dir: Union[str, Path]) -> Optional[Path]:
         "no_warnings": True,
         "verbose": True,  # -v
         "update": True, 
+        "outtmpl": "-"
     }
 
     # Add mobile device parameters
@@ -490,17 +470,12 @@ def download_audio(url: str, temp_dir: Union[str, Path]) -> Optional[Path]:
         "openudid": binascii.hexlify(os.urandom(8)).decode(),
     })
 
-    opts["outtmpl"] = str(outdir / "%(id)s.%(ext)s")
     try:
         with youtube_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-        vid_id = info.get("id")
-        mp3_file = outdir / f"{vid_id}.mp3"
-        if not mp3_file.is_file() or mp3_file.stat().st_size == 0:
-            return None
-        return mp3_file
+            audio_data = ydl.extract_info(url, download=False)
+            return audio_data.get('url')  # Get direct URL for streaming
     except Exception as e:
-        logger.error("download_audio error: %s", e)
+        logger.error(f"Download failed: {str(e)}")
         return None
 
 # Cell 5: strip_silence function
@@ -553,66 +528,27 @@ def preview(obj):
 
 # Cell 8: transcribe_audio function
 @log_entry_exit
-def transcribe_audio(
-    audio_path: Union[str, Path],
-    whisper_model=None,
-    language: str = "ar",
-    min_duration: float = 0.1,
-    chunk_length_s: float = 5.0
-) -> Optional[str]:
-    """
-    Transcribe an MP3 file, trimming silence and optionally chunking.
-    """
+def transcribe_audio(audio_url: str) -> Optional[str]:
+    """Transcribe directly from URL without temp files"""
     try:
-        p = Path(audio_path)
-        if not p.is_file() or p.stat().st_size < 1024:
-            return None
-
-        # Trim silence
-        trimmed = p.with_suffix(".trim.mp3")
-        if strip_silence(p, trimmed):
-            p = trimmed
-
-        # Get duration
-        try:
-            out = subprocess.check_output([
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(p)
-            ], stderr=subprocess.DEVNULL)
-            duration = float(out.strip())
-        except Exception:
-            duration = 0.0
-
-        if duration < min_duration:
-            return None
-
-        model = whisper_model or whisper.load_model("base")
-        if duration <= chunk_length_s:
-            res = model.transcribe(str(p), language=language, fp16=False, verbose=False)
-            return res.get("text", "").strip() or None
-
-        texts = []
-        num_chunks = int(np.ceil(duration / chunk_length_s))
-        for i in range(num_chunks):
-            start = i * chunk_length_s
-            chunk_file = p.with_name(f"{p.stem}.chunk{i}.mp3")
-            subprocess.run([
-                "ffmpeg", "-y", "-ss", str(start), "-t", str(chunk_length_s),
-                "-i", str(p), "-acodec", "mp3", str(chunk_file)
-            ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            res = model.transcribe(str(chunk_file), language=language, fp16=False, verbose=False)
-            texts.append(res.get("text", "").strip())
-            safe_cleanup(chunk_file)
-
-        trans = " ".join(t for t in texts if t)
-        print(trans)
+        # Stream audio directly
+        audio = whisper.load_audio(audio_url, duration=90)
+        audio = whisper.pad_or_trim(audio)
+        
+        # Use tiny model
+        model = app.state.whisper_model
+        mel = whisper.log_mel_spectrogram(audio).to(model.device)
+        
+        # Fast decoding
+        options = whisper.DecodingOptions(language="ar", beam_size=1, fp16=False)
+        result = whisper.decode(model, mel, options)
+        return result.text
+    except Exception as e:
+        logger.error(f"Streaming transcription failed: {str(e)}")
+        return None
     finally:
         import gc
-        del model  # Unload Whisper explicitly
-        gc.collect()  # Force garbage collection
-    return trans
+        gc.collect()
 #####################
 
 # =============================================================================
